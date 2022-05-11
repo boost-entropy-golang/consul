@@ -4,7 +4,6 @@ import (
 	"context"
 	"io"
 	"sync"
-	"testing"
 	"time"
 
 	"google.golang.org/grpc/metadata"
@@ -190,11 +189,4 @@ type incrementalTime struct {
 func (t *incrementalTime) Now() time.Time {
 	t.next++
 	return t.base.Add(time.Duration(t.next) * time.Second)
-}
-
-func runStep(t *testing.T, name string, fn func(t *testing.T)) {
-	t.Helper()
-	if !t.Run(name, fn) {
-		t.FailNow()
-	}
 }
