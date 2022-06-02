@@ -428,6 +428,7 @@
             "Registerer": null,
             "SummaryDefinitions": []
         },
+        "RetryFailedConfiguration": false,
         "StatsdAddr": "",
         "StatsiteAddr": ""
     },

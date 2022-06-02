@@ -2,17 +2,24 @@ package peering
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"sort"
 	"testing"
 	"time"
 
+	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes"
+	"github.com/golang/protobuf/ptypes/any"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/genproto/googleapis/rpc/code"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/hashicorp/go-uuid"
+
+	"github.com/hashicorp/consul/agent/connect"
 	"github.com/hashicorp/consul/agent/consul/state"
 	"github.com/hashicorp/consul/agent/consul/stream"
 	"github.com/hashicorp/consul/agent/structs"
@@ -23,6 +30,128 @@ import (
 	"github.com/hashicorp/consul/sdk/testutil"
 	"github.com/hashicorp/consul/sdk/testutil/retry"
 )
+
+func TestStreamResources_Server_Follower(t *testing.T) {
+	publisher := stream.NewEventPublisher(10 * time.Second)
+	store := newStateStore(t, publisher)
+
+	srv := NewService(
+		testutil.Logger(t),
+		Config{
+			Datacenter:     "dc1",
+			ConnectEnabled: true,
+		},
+		&testStreamBackend{
+			store: store,
+			pub:   publisher,
+			leader: func() bool {
+				return false
+			},
+		})
+
+	client := NewMockClient(context.Background())
+
+	errCh := make(chan error, 1)
+	client.ErrCh = errCh
+
+	go func() {
+		// Pass errors from server handler into ErrCh so that they can be seen by the client on Recv().
+		// This matches gRPC's behavior when an error is returned by a server.
+		err := srv.StreamResources(client.ReplicationStream)
+		if err != nil {
+			errCh <- err
+		}
+	}()
+
+	msg, err := client.Recv()
+	require.Nil(t, msg)
+	require.Error(t, err)
+	require.EqualError(t, err, "rpc error: code = FailedPrecondition desc = cannot establish a peering stream on a follower node")
+}
+
+// TestStreamResources_Server_LeaderBecomesFollower simulates a srv that is a leader when the
+// subscription request is sent but loses leadership status for subsequent messages.
+func TestStreamResources_Server_LeaderBecomesFollower(t *testing.T) {
+	publisher := stream.NewEventPublisher(10 * time.Second)
+	store := newStateStore(t, publisher)
+
+	first := true
+	leaderFunc := func() bool {
+		if first {
+			first = false
+			return true
+		}
+		return false
+	}
+
+	srv := NewService(
+		testutil.Logger(t),
+		Config{
+			Datacenter:     "dc1",
+			ConnectEnabled: true,
+		},
+		&testStreamBackend{
+			store:  store,
+			pub:    publisher,
+			leader: leaderFunc,
+		})
+
+	client := NewMockClient(context.Background())
+
+	errCh := make(chan error, 1)
+	client.ErrCh = errCh
+
+	go func() {
+		err := srv.StreamResources(client.ReplicationStream)
+		if err != nil {
+			errCh <- err
+		}
+	}()
+
+	p := writeInitiatedPeering(t, store, 1, "my-peer")
+	peerID := p.ID
+
+	// Set the initial roots and CA configuration.
+	_, _ = writeInitialRootsAndCA(t, store)
+
+	// Receive a subscription from a peer
+	sub := &pbpeering.ReplicationMessage{
+		Payload: &pbpeering.ReplicationMessage_Request_{
+			Request: &pbpeering.ReplicationMessage_Request{
+				PeerID:      peerID,
+				ResourceURL: pbpeering.TypeURLService,
+			},
+		},
+	}
+	err := client.Send(sub)
+	require.NoError(t, err)
+
+	msg, err := client.Recv()
+	require.NoError(t, err)
+	require.NotEmpty(t, msg)
+
+	receiveRoots, err := client.Recv()
+	require.NoError(t, err)
+	require.NotNil(t, receiveRoots.GetResponse())
+	require.Equal(t, pbpeering.TypeURLRoots, receiveRoots.GetResponse().ResourceURL)
+
+	input2 := &pbpeering.ReplicationMessage{
+		Payload: &pbpeering.ReplicationMessage_Request_{
+			Request: &pbpeering.ReplicationMessage_Request{
+				ResourceURL: pbpeering.TypeURLService,
+				Nonce:       "1",
+			},
+		},
+	}
+
+	err2 := client.Send(input2)
+	require.NoError(t, err2)
+
+	msg2, err2 := client.Recv()
+	require.Nil(t, msg2)
+	require.Error(t, err2)
+	require.EqualError(t, err2, "rpc error: code = FailedPrecondition desc = node is not a leader anymore; cannot continue streaming")
+}
 
 func TestStreamResources_Server_FirstRequest(t *testing.T) {
 	type testCase struct {
@@ -35,10 +164,15 @@ func TestStreamResources_Server_FirstRequest(t *testing.T) {
 		publisher := stream.NewEventPublisher(10 * time.Second)
 		store := newStateStore(t, publisher)
 
-		srv := NewService(testutil.Logger(t), &testStreamBackend{
-			store: store,
-			pub:   publisher,
-		})
+		srv := NewService(
+			testutil.Logger(t),
+			Config{
+				Datacenter:     "dc1",
+				ConnectEnabled: true,
+			}, &testStreamBackend{
+				store: store,
+				pub:   publisher,
+			})
 
 		client := NewMockClient(context.Background())
 
@@ -136,50 +270,39 @@ func TestStreamResources_Server_Terminate(t *testing.T) {
 	publisher := stream.NewEventPublisher(10 * time.Second)
 	store := newStateStore(t, publisher)
 
-	srv := NewService(testutil.Logger(t), &testStreamBackend{
-		store: store,
-		pub:   publisher,
-	})
+	srv := NewService(
+		testutil.Logger(t),
+		Config{
+			Datacenter:     "dc1",
+			ConnectEnabled: true,
+		}, &testStreamBackend{
+			store: store,
+			pub:   publisher,
+		})
 
 	it := incrementalTime{
 		base: time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC),
 	}
 	srv.streams.timeNow = it.Now
 
-	client := NewMockClient(context.Background())
+	p := writeInitiatedPeering(t, store, 1, "my-peer")
+	var (
+		peerID       = p.ID     // for Send
+		remotePeerID = p.PeerID // for Recv
+	)
 
-	errCh := make(chan error, 1)
-	client.ErrCh = errCh
+	// Set the initial roots and CA configuration.
+	_, _ = writeInitialRootsAndCA(t, store)
 
-	go func() {
-		// Pass errors from server handler into ErrCh so that they can be seen by the client on Recv().
-		// This matches gRPC's behavior when an error is returned by a server.
-		if err := srv.StreamResources(client.ReplicationStream); err != nil {
-			errCh <- err
-		}
-	}()
+	client := makeClient(t, srv, peerID, remotePeerID)
 
-	peering := pbpeering.Peering{
-		Name: "my-peer",
-	}
-	require.NoError(t, store.PeeringWrite(0, &peering))
-
-	_, p, err := store.PeeringRead(nil, state.Query{Value: "my-peer"})
+	// TODO(peering): test fails if we don't drain the stream with this call because the
+	// server gets blocked sending the termination message. Figure out a way to let
+	// messages queue and filter replication messages.
+	receiveRoots, err := client.Recv()
 	require.NoError(t, err)
-
-	// Receive a subscription from a peer
-	peerID := p.ID
-
-	sub := &pbpeering.ReplicationMessage{
-		Payload: &pbpeering.ReplicationMessage_Request_{
-			Request: &pbpeering.ReplicationMessage_Request{
-				PeerID:      peerID,
-				ResourceURL: pbpeering.TypeURLService,
-			},
-		},
-	}
-	err = client.Send(sub)
-	require.NoError(t, err)
+	require.NotNil(t, receiveRoots.GetResponse())
+	require.Equal(t, pbpeering.TypeURLRoots, receiveRoots.GetResponse().ResourceURL)
 
 	testutil.RunStep(t, "new stream gets tracked", func(t *testing.T) {
 		retry.Run(t, func(r *retry.R) {
@@ -188,20 +311,6 @@ func TestStreamResources_Server_Terminate(t *testing.T) {
 			require.True(r, status.Connected)
 		})
 	})
-
-	// Receive subscription to my-peer-B's resources
-	receivedSub, err := client.Recv()
-	require.NoError(t, err)
-
-	expect := &pbpeering.ReplicationMessage{
-		Payload: &pbpeering.ReplicationMessage_Request_{
-			Request: &pbpeering.ReplicationMessage_Request{
-				ResourceURL: pbpeering.TypeURLService,
-				PeerID:      peerID,
-			},
-		},
-	}
-	prototest.AssertDeepEqual(t, expect, receivedSub)
 
 	testutil.RunStep(t, "terminate the stream", func(t *testing.T) {
 		done := srv.ConnectedStreams()[peerID]
@@ -215,7 +324,7 @@ func TestStreamResources_Server_Terminate(t *testing.T) {
 
 	receivedTerm, err := client.Recv()
 	require.NoError(t, err)
-	expect = &pbpeering.ReplicationMessage{
+	expect := &pbpeering.ReplicationMessage{
 		Payload: &pbpeering.ReplicationMessage_Terminated_{
 			Terminated: &pbpeering.ReplicationMessage_Terminated{},
 		},
@@ -227,43 +336,31 @@ func TestStreamResources_Server_StreamTracker(t *testing.T) {
 	publisher := stream.NewEventPublisher(10 * time.Second)
 	store := newStateStore(t, publisher)
 
-	srv := NewService(testutil.Logger(t), &testStreamBackend{
-		store: store,
-		pub:   publisher,
-	})
+	srv := NewService(
+		testutil.Logger(t),
+		Config{
+			Datacenter:     "dc1",
+			ConnectEnabled: true,
+		}, &testStreamBackend{
+			store: store,
+			pub:   publisher,
+		})
 
 	it := incrementalTime{
 		base: time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC),
 	}
 	srv.streams.timeNow = it.Now
 
-	client := NewMockClient(context.Background())
+	// Set the initial roots and CA configuration.
+	_, rootA := writeInitialRootsAndCA(t, store)
 
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- srv.StreamResources(client.ReplicationStream)
-	}()
+	p := writeInitiatedPeering(t, store, 1, "my-peer")
+	var (
+		peerID       = p.ID     // for Send
+		remotePeerID = p.PeerID // for Recv
+	)
 
-	peering := pbpeering.Peering{
-		Name: "my-peer",
-	}
-	require.NoError(t, store.PeeringWrite(0, &peering))
-
-	_, p, err := store.PeeringRead(nil, state.Query{Value: "my-peer"})
-	require.NoError(t, err)
-
-	peerID := p.ID
-
-	sub := &pbpeering.ReplicationMessage{
-		Payload: &pbpeering.ReplicationMessage_Request_{
-			Request: &pbpeering.ReplicationMessage_Request{
-				PeerID:      peerID,
-				ResourceURL: pbpeering.TypeURLService,
-			},
-		},
-	}
-	err = client.Send(sub)
-	require.NoError(t, err)
+	client := makeClient(t, srv, peerID, remotePeerID)
 
 	testutil.RunStep(t, "new stream gets tracked", func(t *testing.T) {
 		retry.Run(t, func(r *retry.R) {
@@ -271,22 +368,6 @@ func TestStreamResources_Server_StreamTracker(t *testing.T) {
 			require.True(r, ok)
 			require.True(r, status.Connected)
 		})
-	})
-
-	testutil.RunStep(t, "client receives initial subscription", func(t *testing.T) {
-		ack, err := client.Recv()
-		require.NoError(t, err)
-
-		expectAck := &pbpeering.ReplicationMessage{
-			Payload: &pbpeering.ReplicationMessage_Request_{
-				Request: &pbpeering.ReplicationMessage_Request{
-					ResourceURL: pbpeering.TypeURLService,
-					PeerID:      peerID,
-					Nonce:       "",
-				},
-			},
-		}
-		prototest.AssertDeepEqual(t, expectAck, ack)
 	})
 
 	var sequence uint64
@@ -370,12 +451,31 @@ func TestStreamResources_Server_StreamTracker(t *testing.T) {
 					ResourceID:  "api",
 					Nonce:       "21",
 					Operation:   pbpeering.ReplicationMessage_Response_UPSERT,
+					Resource:    makeAnyPB(t, &pbservice.IndexedCheckServiceNodes{}),
 				},
 			},
 		}
 		err := client.Send(resp)
 		require.NoError(t, err)
 		sequence++
+
+		expectRoots := &pbpeering.ReplicationMessage{
+			Payload: &pbpeering.ReplicationMessage_Response_{
+				Response: &pbpeering.ReplicationMessage_Response{
+					ResourceURL: pbpeering.TypeURLRoots,
+					ResourceID:  "roots",
+					Resource: makeAnyPB(t, &pbpeering.PeeringTrustBundle{
+						TrustDomain: connect.TestTrustDomain,
+						RootPEMs:    []string{rootA.RootCert},
+					}),
+					Operation: pbpeering.ReplicationMessage_Response_UPSERT,
+				},
+			},
+		}
+
+		roots, err := client.Recv()
+		require.NoError(t, err)
+		prototest.AssertDeepEqual(t, expectRoots, roots)
 
 		ack, err := client.Recv()
 		require.NoError(t, err)
@@ -490,73 +590,36 @@ func TestStreamResources_Server_StreamTracker(t *testing.T) {
 			require.Equal(r, expect, status)
 		})
 	})
-
-	select {
-	case err := <-errCh:
-		// Client disconnect is not an error, but should make the handler return.
-		require.NoError(t, err)
-	case <-time.After(50 * time.Millisecond):
-		t.Fatalf("timed out waiting for handler to finish")
-	}
 }
 
 func TestStreamResources_Server_ServiceUpdates(t *testing.T) {
+	testStreamResources_Server_ServiceUpdates(t, true)
+}
+func TestStreamResources_Server_ServiceUpdates_EnableMeshGateways(t *testing.T) {
+	testStreamResources_Server_ServiceUpdates(t, false)
+}
+func testStreamResources_Server_ServiceUpdates(t *testing.T, disableMeshGateways bool) {
 	publisher := stream.NewEventPublisher(10 * time.Second)
 	store := newStateStore(t, publisher)
 
 	// Create a peering
 	var lastIdx uint64 = 1
-	err := store.PeeringWrite(lastIdx, &pbpeering.Peering{
-		Name: "my-peering",
-	})
-	require.NoError(t, err)
+	p := writeInitiatedPeering(t, store, lastIdx, "my-peering")
 
-	_, p, err := store.PeeringRead(nil, state.Query{Value: "my-peering"})
-	require.NoError(t, err)
-	require.NotNil(t, p)
+	// Set the initial roots and CA configuration.
+	_, _ = writeInitialRootsAndCA(t, store)
 
-	srv := NewService(testutil.Logger(t), &testStreamBackend{
-		store: store,
-		pub:   publisher,
-	})
-
-	client := NewMockClient(context.Background())
-
-	errCh := make(chan error, 1)
-	client.ErrCh = errCh
-
-	go func() {
-		// Pass errors from server handler into ErrCh so that they can be seen by the client on Recv().
-		// This matches gRPC's behavior when an error is returned by a server.
-		if err := srv.StreamResources(client.ReplicationStream); err != nil {
-			errCh <- err
-		}
-	}()
-
-	// Issue a services subscription to server
-	init := &pbpeering.ReplicationMessage{
-		Payload: &pbpeering.ReplicationMessage_Request_{
-			Request: &pbpeering.ReplicationMessage_Request{
-				PeerID:      p.ID,
-				ResourceURL: pbpeering.TypeURLService,
-			},
-		},
-	}
-	require.NoError(t, client.Send(init))
-
-	// Receive a services subscription from server
-	receivedSub, err := client.Recv()
-	require.NoError(t, err)
-
-	expect := &pbpeering.ReplicationMessage{
-		Payload: &pbpeering.ReplicationMessage_Request_{
-			Request: &pbpeering.ReplicationMessage_Request{
-				ResourceURL: pbpeering.TypeURLService,
-				PeerID:      p.ID,
-			},
-		},
-	}
-	prototest.AssertDeepEqual(t, expect, receivedSub)
+	srv := NewService(
+		testutil.Logger(t),
+		Config{
+			Datacenter:             "dc1",
+			ConnectEnabled:         true,
+			DisableMeshGatewayMode: disableMeshGateways,
+		}, &testStreamBackend{
+			store: store,
+			pub:   publisher,
+		})
+	client := makeClient(t, srv, p.ID, p.PeerID)
 
 	// Register a service that is not yet exported
 	mysql := &structs.CheckServiceNode{
@@ -570,6 +633,22 @@ func TestStreamResources_Server_ServiceUpdates(t *testing.T) {
 	lastIdx++
 	require.NoError(t, store.EnsureService(lastIdx, "foo", mysql.Service))
 
+	lastIdx++
+	require.NoError(t, store.EnsureService(lastIdx, "foo", &structs.NodeService{
+		ID:      "mysql-sidecar-proxy",
+		Service: "mysql-sidecar-proxy",
+		Kind:    structs.ServiceKindConnectProxy,
+		Port:    5000,
+		Proxy:   structs.ConnectProxyConfig{DestinationServiceName: "mysql"},
+	}))
+
+	var (
+		mongoSN      = structs.NewServiceName("mongo", nil).String()
+		mongoProxySN = structs.NewServiceName("mongo-sidecar-proxy", nil).String()
+		mysqlSN      = structs.NewServiceName("mysql", nil).String()
+		mysqlProxySN = structs.NewServiceName("mysql-sidecar-proxy", nil).String()
+	)
+
 	testutil.RunStep(t, "exporting mysql leads to an UPSERT event", func(t *testing.T) {
 		entry := &structs.ExportedServicesConfigEntry{
 			Name: "default",
@@ -577,36 +656,60 @@ func TestStreamResources_Server_ServiceUpdates(t *testing.T) {
 				{
 					Name: "mysql",
 					Consumers: []structs.ServiceConsumer{
-						{
-							PeerName: "my-peering",
-						},
+						{PeerName: "my-peering"},
 					},
 				},
 				{
 					// Mongo does not get pushed because it does not have instances registered.
 					Name: "mongo",
 					Consumers: []structs.ServiceConsumer{
-						{
-							PeerName: "my-peering",
-						},
+						{PeerName: "my-peering"},
 					},
 				},
 			},
 		}
 		lastIdx++
-		err = store.EnsureConfigEntry(lastIdx, entry)
-		require.NoError(t, err)
+		require.NoError(t, store.EnsureConfigEntry(lastIdx, entry))
 
-		retry.Run(t, func(r *retry.R) {
-			msg, err := client.RecvWithTimeout(100 * time.Millisecond)
-			require.NoError(r, err)
-			require.Equal(r, pbpeering.ReplicationMessage_Response_UPSERT, msg.GetResponse().Operation)
-			require.Equal(r, mysql.Service.CompoundServiceName().String(), msg.GetResponse().ResourceID)
+		expectReplEvents(t, client,
+			func(t *testing.T, msg *pbpeering.ReplicationMessage) {
+				require.Equal(t, pbpeering.TypeURLRoots, msg.GetResponse().ResourceURL)
+				// Roots tested in TestStreamResources_Server_CARootUpdates
+			},
+			func(t *testing.T, msg *pbpeering.ReplicationMessage) {
+				require.Equal(t, pbpeering.TypeURLService, msg.GetResponse().ResourceURL)
+				require.Equal(t, mongoSN, msg.GetResponse().ResourceID)
+				require.Equal(t, pbpeering.ReplicationMessage_Response_DELETE, msg.GetResponse().Operation)
+				require.Nil(t, msg.GetResponse().Resource)
+			},
+			func(t *testing.T, msg *pbpeering.ReplicationMessage) {
+				require.Equal(t, pbpeering.TypeURLService, msg.GetResponse().ResourceURL)
+				require.Equal(t, mongoProxySN, msg.GetResponse().ResourceID)
+				require.Equal(t, pbpeering.ReplicationMessage_Response_DELETE, msg.GetResponse().Operation)
+				require.Nil(t, msg.GetResponse().Resource)
+			},
+			func(t *testing.T, msg *pbpeering.ReplicationMessage) {
+				require.Equal(t, pbpeering.TypeURLService, msg.GetResponse().ResourceURL)
+				require.Equal(t, mysqlSN, msg.GetResponse().ResourceID)
+				require.Equal(t, pbpeering.ReplicationMessage_Response_UPSERT, msg.GetResponse().Operation)
 
-			var nodes pbservice.IndexedCheckServiceNodes
-			require.NoError(r, ptypes.UnmarshalAny(msg.GetResponse().Resource, &nodes))
-			require.Len(r, nodes.Nodes, 1)
-		})
+				var nodes pbservice.IndexedCheckServiceNodes
+				require.NoError(t, ptypes.UnmarshalAny(msg.GetResponse().Resource, &nodes))
+				require.Len(t, nodes.Nodes, 1)
+			},
+			func(t *testing.T, msg *pbpeering.ReplicationMessage) {
+				require.Equal(t, pbpeering.TypeURLService, msg.GetResponse().ResourceURL)
+				require.Equal(t, mysqlProxySN, msg.GetResponse().ResourceID)
+				require.Equal(t, pbpeering.ReplicationMessage_Response_UPSERT, msg.GetResponse().Operation)
+
+				var nodes pbservice.IndexedCheckServiceNodes
+				require.NoError(t, ptypes.UnmarshalAny(msg.GetResponse().Resource, &nodes))
+				require.Len(t, nodes.Nodes, 1)
+
+				svid := "spiffe://11111111-2222-3333-4444-555555555555.consul/ns/default/dc/dc1/svc/mysql"
+				require.Equal(t, []string{svid}, nodes.Nodes[0].Service.Connect.PeerMeta.SpiffeID)
+			},
+		)
 	})
 
 	mongo := &structs.CheckServiceNode{
@@ -648,7 +751,7 @@ func TestStreamResources_Server_ServiceUpdates(t *testing.T) {
 			},
 		}
 		lastIdx++
-		err = store.EnsureConfigEntry(lastIdx, entry)
+		err := store.EnsureConfigEntry(lastIdx, entry)
 		require.NoError(t, err)
 
 		retry.Run(t, func(r *retry.R) {
@@ -662,7 +765,7 @@ func TestStreamResources_Server_ServiceUpdates(t *testing.T) {
 
 	testutil.RunStep(t, "deleting the config entry leads to a DELETE event for mongo", func(t *testing.T) {
 		lastIdx++
-		err = store.DeleteConfigEntry(lastIdx, structs.ExportedServices, "default", nil)
+		err := store.DeleteConfigEntry(lastIdx, structs.ExportedServices, "default", nil)
 		require.NoError(t, err)
 
 		retry.Run(t, func(r *retry.R) {
@@ -675,9 +778,158 @@ func TestStreamResources_Server_ServiceUpdates(t *testing.T) {
 	})
 }
 
+func TestStreamResources_Server_CARootUpdates(t *testing.T) {
+	publisher := stream.NewEventPublisher(10 * time.Second)
+
+	store := newStateStore(t, publisher)
+
+	// Create a peering
+	var lastIdx uint64 = 1
+	p := writeInitiatedPeering(t, store, lastIdx, "my-peering")
+
+	srv := NewService(
+		testutil.Logger(t),
+		Config{
+			Datacenter:     "dc1",
+			ConnectEnabled: true,
+		}, &testStreamBackend{
+			store: store,
+			pub:   publisher,
+		})
+
+	// Set the initial roots and CA configuration.
+	clusterID, rootA := writeInitialRootsAndCA(t, store)
+
+	client := makeClient(t, srv, p.ID, p.PeerID)
+
+	testutil.RunStep(t, "initial CA Roots replication", func(t *testing.T) {
+		expectReplEvents(t, client,
+			func(t *testing.T, msg *pbpeering.ReplicationMessage) {
+				require.Equal(t, pbpeering.TypeURLRoots, msg.GetResponse().ResourceURL)
+				require.Equal(t, "roots", msg.GetResponse().ResourceID)
+				require.Equal(t, pbpeering.ReplicationMessage_Response_UPSERT, msg.GetResponse().Operation)
+
+				var trustBundle pbpeering.PeeringTrustBundle
+				require.NoError(t, ptypes.UnmarshalAny(msg.GetResponse().Resource, &trustBundle))
+
+				require.ElementsMatch(t, []string{rootA.RootCert}, trustBundle.RootPEMs)
+				expect := connect.SpiffeIDSigningForCluster(clusterID).Host()
+				require.Equal(t, expect, trustBundle.TrustDomain)
+			},
+		)
+	})
+
+	testutil.RunStep(t, "CA root rotation sends upsert event", func(t *testing.T) {
+		// get max index for CAS operation
+		cidx, _, err := store.CARoots(nil)
+		require.NoError(t, err)
+
+		rootB := connect.TestCA(t, nil)
+		rootC := connect.TestCA(t, nil)
+		rootC.Active = false // there can only be one active root
+		lastIdx++
+		set, err := store.CARootSetCAS(lastIdx, cidx, []*structs.CARoot{rootB, rootC})
+		require.True(t, set)
+		require.NoError(t, err)
+
+		expectReplEvents(t, client,
+			func(t *testing.T, msg *pbpeering.ReplicationMessage) {
+				require.Equal(t, pbpeering.TypeURLRoots, msg.GetResponse().ResourceURL)
+				require.Equal(t, "roots", msg.GetResponse().ResourceID)
+				require.Equal(t, pbpeering.ReplicationMessage_Response_UPSERT, msg.GetResponse().Operation)
+
+				var trustBundle pbpeering.PeeringTrustBundle
+				require.NoError(t, ptypes.UnmarshalAny(msg.GetResponse().Resource, &trustBundle))
+
+				require.ElementsMatch(t, []string{rootB.RootCert, rootC.RootCert}, trustBundle.RootPEMs)
+				expect := connect.SpiffeIDSigningForCluster(clusterID).Host()
+				require.Equal(t, expect, trustBundle.TrustDomain)
+			},
+		)
+	})
+}
+
+// makeClient sets up a *MockClient with the initial subscription
+// message handshake.
+func makeClient(
+	t *testing.T,
+	srv pbpeering.PeeringServiceServer,
+	peerID string,
+	remotePeerID string,
+) *MockClient {
+	t.Helper()
+
+	client := NewMockClient(context.Background())
+
+	errCh := make(chan error, 1)
+	client.ErrCh = errCh
+
+	go func() {
+		// Pass errors from server handler into ErrCh so that they can be seen by the client on Recv().
+		// This matches gRPC's behavior when an error is returned by a server.
+		if err := srv.StreamResources(client.ReplicationStream); err != nil {
+			errCh <- srv.StreamResources(client.ReplicationStream)
+		}
+	}()
+
+	// Issue a services subscription to server
+	init := &pbpeering.ReplicationMessage{
+		Payload: &pbpeering.ReplicationMessage_Request_{
+			Request: &pbpeering.ReplicationMessage_Request{
+				PeerID:      peerID,
+				ResourceURL: pbpeering.TypeURLService,
+			},
+		},
+	}
+	require.NoError(t, client.Send(init))
+
+	// Receive a services subscription from server
+	receivedSub, err := client.Recv()
+	require.NoError(t, err)
+
+	expect := &pbpeering.ReplicationMessage{
+		Payload: &pbpeering.ReplicationMessage_Request_{
+			Request: &pbpeering.ReplicationMessage_Request{
+				ResourceURL: pbpeering.TypeURLService,
+				PeerID:      remotePeerID,
+			},
+		},
+	}
+	prototest.AssertDeepEqual(t, expect, receivedSub)
+
+	return client
+}
+
 type testStreamBackend struct {
-	pub   state.EventPublisher
-	store *state.Store
+	pub               state.EventPublisher
+	store             *state.Store
+	leader            func() bool
+	leadershipMonitor *leadershipMonitor
+}
+
+var _ LeadershipMonitor = (*leadershipMonitor)(nil)
+
+type leadershipMonitor struct {
+}
+
+func (l *leadershipMonitor) UpdateLeaderAddr(addr string) {
+	// noop
+}
+
+func (l *leadershipMonitor) GetLeaderAddr() string {
+	// noop
+	return ""
+}
+
+func (b *testStreamBackend) LeadershipMonitor() LeadershipMonitor {
+	return b.leadershipMonitor
+}
+
+func (b *testStreamBackend) IsLeader() bool {
+	if b.leader != nil {
+		return b.leader()
+	}
+	return true
 }
 
 func (b *testStreamBackend) Subscribe(req *stream.SubscribeRequest) (*stream.Subscription, error) {
@@ -730,10 +982,16 @@ func Test_processResponse_Validation(t *testing.T) {
 
 	publisher := stream.NewEventPublisher(10 * time.Second)
 	store := newStateStore(t, publisher)
-	srv := NewService(testutil.Logger(t), &testStreamBackend{
-		store: store,
-		pub:   publisher,
-	})
+
+	srv := NewService(
+		testutil.Logger(t),
+		Config{
+			Datacenter:     "dc1",
+			ConnectEnabled: true,
+		}, &testStreamBackend{
+			store: store,
+			pub:   publisher,
+		})
 
 	run := func(t *testing.T, tc testCase) {
 		reply, err := srv.processResponse("", "", tc.in)
@@ -753,6 +1011,7 @@ func Test_processResponse_Validation(t *testing.T) {
 				ResourceID:  "api",
 				Nonce:       "1",
 				Operation:   pbpeering.ReplicationMessage_Response_UPSERT,
+				Resource:    makeAnyPB(t, &pbservice.IndexedCheckServiceNodes{}),
 			},
 			expect: &pbpeering.ReplicationMessage{
 				Payload: &pbpeering.ReplicationMessage_Request_{
@@ -838,7 +1097,7 @@ func Test_processResponse_Validation(t *testing.T) {
 						Nonce:       "1",
 						Error: &pbstatus.Status{
 							Code:    int32(code.Code_INVALID_ARGUMENT),
-							Message: `unsupported operation: "100000"`,
+							Message: `unsupported operation: 100000`,
 						},
 					},
 				},
@@ -850,5 +1109,115 @@ func Test_processResponse_Validation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			run(t, tc)
 		})
+	}
+}
+
+// writeInitiatedPeering creates a peering with the provided name and ensures
+// the PeerID field is set for the ID of the remote peer.
+func writeInitiatedPeering(t *testing.T, store *state.Store, idx uint64, peerName string) *pbpeering.Peering {
+	remotePeerID, err := uuid.GenerateUUID()
+	require.NoError(t, err)
+
+	peering := pbpeering.Peering{
+		Name:   peerName,
+		PeerID: remotePeerID,
+	}
+	require.NoError(t, store.PeeringWrite(idx, &peering))
+
+	_, p, err := store.PeeringRead(nil, state.Query{Value: peerName})
+	require.NoError(t, err)
+
+	return p
+}
+
+func writeInitialRootsAndCA(t *testing.T, store *state.Store) (string, *structs.CARoot) {
+	const clusterID = connect.TestClusterID
+
+	rootA := connect.TestCA(t, nil)
+	_, err := store.CARootSetCAS(1, 0, structs.CARoots{rootA})
+	require.NoError(t, err)
+
+	err = store.CASetConfig(0, &structs.CAConfiguration{ClusterID: clusterID})
+	require.NoError(t, err)
+
+	return clusterID, rootA
+}
+
+func makeAnyPB(t *testing.T, pb proto.Message) *any.Any {
+	any, err := ptypes.MarshalAny(pb)
+	require.NoError(t, err)
+	return any
+}
+
+func expectReplEvents(t *testing.T, client *MockClient, checkFns ...func(t *testing.T, got *pbpeering.ReplicationMessage)) {
+	t.Helper()
+
+	num := len(checkFns)
+
+	if num == 0 {
+		// No updates should be received.
+		msg, err := client.RecvWithTimeout(100 * time.Millisecond)
+		if err == io.EOF && msg == nil {
+			return
+		} else if err != nil {
+			t.Fatalf("received unexpected update error: %v", err)
+		} else {
+			t.Fatalf("received unexpected update: %+v", msg)
+		}
+	}
+
+	var out []*pbpeering.ReplicationMessage
+	for len(out) < num {
+		msg, err := client.RecvWithTimeout(100 * time.Millisecond)
+		if err == io.EOF && msg == nil {
+			t.Fatalf("timed out with %d of %d events", len(out), num)
+		}
+		require.NoError(t, err)
+		out = append(out, msg)
+	}
+
+	if msg, err := client.RecvWithTimeout(100 * time.Millisecond); err != io.EOF || msg != nil {
+		t.Fatalf("expected only %d events but got more; prev %+v; next %+v", num, out, msg)
+	}
+
+	require.Len(t, out, num)
+
+	sort.SliceStable(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+
+		typeA := fmt.Sprintf("%T", a.GetPayload())
+		typeB := fmt.Sprintf("%T", b.GetPayload())
+		if typeA != typeB {
+			return typeA < typeB
+		}
+
+		switch a.GetPayload().(type) {
+		case *pbpeering.ReplicationMessage_Request_:
+			reqA, reqB := a.GetRequest(), b.GetRequest()
+			if reqA.ResourceURL != reqB.ResourceURL {
+				return reqA.ResourceURL < reqB.ResourceURL
+			}
+			return reqA.Nonce < reqB.Nonce
+
+		case *pbpeering.ReplicationMessage_Response_:
+			respA, respB := a.GetResponse(), b.GetResponse()
+			if respA.ResourceURL != respB.ResourceURL {
+				return respA.ResourceURL < respB.ResourceURL
+			}
+			if respA.ResourceID != respB.ResourceID {
+				return respA.ResourceID < respB.ResourceID
+			}
+			return respA.Nonce < respB.Nonce
+
+		case *pbpeering.ReplicationMessage_Terminated_:
+			return false
+
+		default:
+			panic("unknown type")
+		}
+	})
+
+	for i := 0; i < num; i++ {
+		checkFns[i](t, out[i])
 	}
 }

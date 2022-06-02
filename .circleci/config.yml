@@ -168,6 +168,14 @@ jobs:
       - run: go install github.com/hashicorp/lint-consul-retry@master && lint-consul-retry
       - run: *notify-slack-failure
 
+  lint-enums:
+    docker:
+      - image: *GOLANG_IMAGE
+    steps:
+      - checkout
+      - run: go install github.com/reillywatson/enumcover/cmd/enumcover@master && enumcover ./...
+      - run: *notify-slack-failure
+
   lint:
     description: "Run golangci-lint"
     parameters:
@@ -185,9 +193,7 @@ jobs:
       - run: go env
       - run:
           name: Install golangci-lint
-          command: |
-            download=https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh
-            wget -O- -q $download | sh -x -s -- -d -b /home/circleci/go/bin v1.45.2
+          command: make lint-tools
       - run: go mod download
       - run:
           name: lint
@@ -239,6 +245,9 @@ jobs:
             echo "Generated code was not updated correctly"
             exit 1
           fi
+      - run: 
+          name: "Protobuf Lint"
+          command: make proto-lint
 
   go-test-arm64:
     machine:
@@ -254,7 +263,7 @@ jobs:
     steps:
       - checkout
       - run:
-         command: |
+          command: |
             sudo rm -rf /usr/local/go
             wget https://dl.google.com/go/go${GO_VERSION}.linux-arm64.tar.gz
             sudo tar -C /usr/local -xzvf go${GO_VERSION}.linux-arm64.tar.gz
@@ -548,17 +557,17 @@ jobs:
   # Run integration tests on nomad/v0.8.7
   nomad-integration-0_8:
     docker:
-      - image: docker.mirror.hashicorp.services/circleci/golang:1.10
+      - image: docker.mirror.hashicorp.services/cimg/go:1.10
     environment:
       <<: *ENVIRONMENT
-      NOMAD_WORKING_DIR: &NOMAD_WORKING_DIR /go/src/github.com/hashicorp/nomad
+      NOMAD_WORKING_DIR: &NOMAD_WORKING_DIR /home/circleci/go/src/github.com/hashicorp/nomad
       NOMAD_VERSION: v0.8.7
     steps: &NOMAD_INTEGRATION_TEST_STEPS
       - run: git clone https://github.com/hashicorp/nomad.git --branch ${NOMAD_VERSION} ${NOMAD_WORKING_DIR}
 
       # get consul binary
       - attach_workspace:
-          at: /go/bin
+          at: /home/circleci/go/bin
 
       # make dev build of nomad
       - run:
@@ -588,10 +597,10 @@ jobs:
   # run integration tests on nomad/main
   nomad-integration-main:
     docker:
-      - image: docker.mirror.hashicorp.services/circleci/golang:1.17 # TODO: replace with cimg/go (requires steps update)
+      - image: docker.mirror.hashicorp.services/cimg/go:1.18
     environment:
       <<: *ENVIRONMENT
-      NOMAD_WORKING_DIR: /go/src/github.com/hashicorp/nomad
+      NOMAD_WORKING_DIR: /home/circleci/go/src/github.com/hashicorp/nomad
       NOMAD_VERSION: main
     steps: *NOMAD_INTEGRATION_TEST_STEPS
 
@@ -663,23 +672,6 @@ jobs:
             - packages/consul-ui/dist
       - run: *notify-slack-failure
 
-  # build static-assets file
-  build-static-assets:
-    docker:
-      - image: *GOLANG_IMAGE
-    steps:
-      - checkout
-      - attach_workspace:
-          at: ./pkg
-      - run: mv pkg/packages/consul-ui/dist pkg/web_ui # 'make static-assets' looks for the 'pkg/web_ui' path
-      - run: make tools
-      - run: make static-assets
-      - persist_to_workspace:
-          root: .
-          paths:
-            - ./agent/uiserver/bindata_assetfs.go
-      - run: *notify-slack-failure
-
   # commits static assets to git
   publish-static-assets:
     docker:
@@ -692,7 +684,12 @@ jobs:
       - attach_workspace:
           at: .
       - run:
-          name: commit agent/uiserver/bindata_assetfs.go if there are UI changes
+          name: move compiled ui files to agent/uiserver
+          command: |
+            rm -rf agent/uiserver/dist
+            mv packages/consul-ui/dist agent/uiserver
+      - run:
+          name: commit agent/uiserver/dist/ if there are UI changes
           command: |
             # check if there are any changes in ui/
             # if there are, we commit the ui static asset file
@@ -706,8 +703,8 @@ jobs:
               git checkout -B ci/main-assetfs-build main
 
               short_sha=$(git rev-parse --short HEAD)
-              git add agent/uiserver/bindata_assetfs.go
-              git commit -m "auto-updated agent/uiserver/bindata_assetfs.go from commit ${short_sha}"
+              git add agent/uiserver/dist/
+              git commit -m "auto-updated agent/uiserver/dist/ from commit ${short_sha}"
               git push --force origin ci/main-assetfs-build
             else
               echo "no UI changes so no static assets to publish"
@@ -801,7 +798,7 @@ jobs:
           working_directory: ui/packages/consul-ui
           command: make test-coverage-ci
       - run: *notify-slack-failure
-      
+
   compatibility-integration-test:
     machine:
       image: *UBUNTU_CI_IMAGE
@@ -849,7 +846,7 @@ jobs:
       - store_artifacts:
           path: *TEST_RESULTS_DIR
       - run: *notify-slack-failure
-      
+
   envoy-integration-test-1_19_3: &ENVOY_TESTS
     machine:
       image: *UBUNTU_CI_IMAGE
@@ -975,6 +972,7 @@ jobs:
               LOCAL_COMMIT_SHA="<< pipeline.parameters.commit >>"
             fi
             echo "export LOCAL_COMMIT_SHA=${LOCAL_COMMIT_SHA}" >> $BASH_ENV
+            git checkout ${LOCAL_COMMIT_SHA}
 
             short_ref=$(git rev-parse --short ${LOCAL_COMMIT_SHA})
             echo "export TF_VAR_ami_owners=$LOAD_TEST_AMI_OWNERS" >> $BASH_ENV
@@ -994,7 +992,8 @@ jobs:
           working_directory: .circleci/terraform/load-test
           name: terraform init
           command: |
-            echo "commit is ${LOCAL_COMMIT_SHA}"
+            short_ref=$(git rev-parse --short HEAD)
+            echo "Testing commit id: $short_ref"
             terraform init \
             -backend-config="bucket=${BUCKET}" \
             -backend-config="key=${LOCAL_COMMIT_SHA}" \
@@ -1010,7 +1009,7 @@ jobs:
           when: always
           name: terraform destroy
           command: |
-            terraform destroy -auto-approve
+            for i in $(seq 1 5); do terraform destroy -auto-approve && s=0 && break || s=$? && sleep 20; done; (exit $s)
       - run: *notify-slack-failure
 
   # The noop job is a used as a very fast job in the verify-ci workflow because every workflow
@@ -1026,7 +1025,7 @@ workflows:
   # verify-ci is a no-op workflow that must run on every PR. It is used in a
   # branch protection rule to detect when CI workflows are not running.
   verify-ci:
-    jobs: [ noop ]
+    jobs: [noop]
 
   go-tests:
     unless: << pipeline.parameters.trigger-load-test >>
@@ -1039,6 +1038,7 @@ workflows:
                 - /^docs\/.*/
                 - /^ui\/.*/
       - check-generated-protobuf: *filter-ignore-non-go-branches
+      - lint-enums: *filter-ignore-non-go-branches
       - lint-consul-retry: *filter-ignore-non-go-branches
       - lint: *filter-ignore-non-go-branches
       - lint:
@@ -1049,17 +1049,17 @@ workflows:
       - go-test-arm64: *filter-ignore-non-go-branches
       - dev-build: *filter-ignore-non-go-branches
       - go-test:
-          requires: [ dev-build ]
+          requires: [dev-build]
       - go-test-lib:
           name: "go-test-api go1.17"
           path: api
           go-version: "1.17"
-          requires: [ dev-build ]
+          requires: [dev-build]
       - go-test-lib:
           name: "go-test-api go1.18"
           path: api
           go-version: "1.18"
-          requires: [ dev-build ]
+          requires: [dev-build]
       - go-test-lib:
           name: "go-test-sdk go1.17"
           path: sdk
@@ -1072,6 +1072,7 @@ workflows:
           <<: *filter-ignore-non-go-branches
       - go-test-race: *filter-ignore-non-go-branches
       - go-test-32bit: *filter-ignore-non-go-branches
+      - noop
   build-distros:
     unless: << pipeline.parameters.trigger-load-test >>
     jobs:
@@ -1090,20 +1091,12 @@ workflows:
       - ember-build-prod:
           requires:
             - frontend-cache
-      - build-static-assets:
+      - publish-static-assets:
           requires:
             - ember-build-prod
-      - publish-static-assets:
-          filters:
-            branches:
-              only:
-                - main
-                - /release\/\d+\.\d+\.x$/
-          requires:
-            - build-static-assets
       - dev-build:
           requires:
-            - build-static-assets
+            - ember-build-prod
       - dev-upload-s3:
           requires:
             - dev-build
@@ -1111,6 +1104,7 @@ workflows:
           requires:
             - dev-build
           context: consul-ci
+      - noop
   test-integrations:
     unless: << pipeline.parameters.trigger-load-test >>
     jobs:
@@ -1147,7 +1141,7 @@ workflows:
       - compatibility-integration-test:
           requires:
             - dev-build
-
+      - noop
   frontend:
     unless: << pipeline.parameters.trigger-load-test >>
     jobs:
@@ -1180,6 +1174,7 @@ workflows:
       - ember-coverage:
           requires:
             - ember-build-ent
+      - noop
   workflow-automation:
     unless: << pipeline.parameters.trigger-load-test >>
     jobs:
