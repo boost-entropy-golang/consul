@@ -24,8 +24,6 @@ import (
 )
 
 func TestPeerTrustBundles(t testing.T) *pbpeering.TrustBundleListByServiceResponse {
-	t.Helper()
-
 	return &pbpeering.TrustBundleListByServiceResponse{
 		Bundles: []*pbpeering.PeeringTrustBundle{
 			{
@@ -100,6 +98,39 @@ func TestLeafForCA(t testing.T, ca *structs.CARoot) *structs.IssuedCert {
 		PrivateKeyPEM: pkPEM,
 		Service:       "web",
 		ServiceURI:    leafCert.URIs[0].String(),
+		ValidAfter:    leafCert.NotBefore,
+		ValidBefore:   leafCert.NotAfter,
+	}
+}
+
+// TestCertsForMeshGateway generates a CA and Leaf suitable for returning as
+// mock CA root/leaf cache requests in a mesh-gateway for peering.
+func TestCertsForMeshGateway(t testing.T) (*structs.IndexedCARoots, *structs.IssuedCert) {
+	t.Helper()
+
+	ca := connect.TestCA(t, nil)
+	roots := &structs.IndexedCARoots{
+		ActiveRootID: ca.ID,
+		TrustDomain:  fmt.Sprintf("%s.consul", connect.TestClusterID),
+		Roots:        []*structs.CARoot{ca},
+	}
+	return roots, TestMeshGatewayLeafForCA(t, ca)
+}
+
+// TestMeshGatewayLeafForCA generates new mesh-gateway Leaf suitable for returning as mock CA
+// leaf cache response, signed by an existing CA.
+func TestMeshGatewayLeafForCA(t testing.T, ca *structs.CARoot) *structs.IssuedCert {
+	leafPEM, pkPEM := connect.TestMeshGatewayLeaf(t, "default", ca)
+
+	leafCert, err := connect.ParseCert(leafPEM)
+	require.NoError(t, err)
+
+	return &structs.IssuedCert{
+		SerialNumber:  connect.EncodeSerialNumber(leafCert.SerialNumber),
+		CertPEM:       leafPEM,
+		PrivateKeyPEM: pkPEM,
+		Kind:          structs.ServiceKindMeshGateway,
+		KindURI:       leafCert.URIs[0].String(),
 		ValidAfter:    leafCert.NotBefore,
 		ValidBefore:   leafCert.NotAfter,
 	}
@@ -722,6 +753,8 @@ func testConfigSnapshotFixture(
 			ResolvedServiceConfig:           &noopDataSource[*structs.ServiceConfigRequest]{},
 			ServiceList:                     &noopDataSource[*structs.DCSpecificRequest]{},
 			TrustBundle:                     &noopDataSource[*pbpeering.TrustBundleReadRequest]{},
+			TrustBundleList:                 &noopDataSource[*pbpeering.TrustBundleListByServiceRequest]{},
+			ExportedPeeredServices:          &noopDataSource[*structs.DCSpecificRequest]{},
 		},
 		dnsConfig: DNSConfig{ // TODO: make configurable
 			Domain:    "consul",
@@ -922,6 +955,7 @@ func NewTestDataSources() *TestDataSources {
 		ResolvedServiceConfig:           NewTestDataSource[*structs.ServiceConfigRequest, *structs.ServiceConfigResponse](),
 		ServiceList:                     NewTestDataSource[*structs.DCSpecificRequest, *structs.IndexedServiceList](),
 		TrustBundle:                     NewTestDataSource[*pbpeering.TrustBundleReadRequest, *pbpeering.TrustBundleReadResponse](),
+		TrustBundleList:                 NewTestDataSource[*pbpeering.TrustBundleListByServiceRequest, *pbpeering.TrustBundleListByServiceResponse](),
 	}
 	srcs.buildEnterpriseSources()
 	return srcs
@@ -945,6 +979,9 @@ type TestDataSources struct {
 	ResolvedServiceConfig           *TestDataSource[*structs.ServiceConfigRequest, *structs.ServiceConfigResponse]
 	ServiceList                     *TestDataSource[*structs.DCSpecificRequest, *structs.IndexedServiceList]
 	TrustBundle                     *TestDataSource[*pbpeering.TrustBundleReadRequest, *pbpeering.TrustBundleReadResponse]
+	TrustBundleList                 *TestDataSource[*pbpeering.TrustBundleListByServiceRequest, *pbpeering.TrustBundleListByServiceResponse]
+
+	TestDataSourcesEnterprise
 }
 
 func (t *TestDataSources) ToDataSources() DataSources {
@@ -965,6 +1002,7 @@ func (t *TestDataSources) ToDataSources() DataSources {
 		ResolvedServiceConfig:  t.ResolvedServiceConfig,
 		ServiceList:            t.ServiceList,
 		TrustBundle:            t.TrustBundle,
+		TrustBundleList:        t.TrustBundleList,
 	}
 	t.fillEnterpriseDataSources(&ds)
 	return ds

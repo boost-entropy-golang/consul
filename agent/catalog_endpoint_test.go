@@ -603,6 +603,63 @@ func TestCatalogRegister_checkRegistration(t *testing.T) {
 	})
 }
 
+func TestCatalogRegister_checkRegistration_UDP(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
+	t.Parallel()
+	a := NewTestAgent(t, "")
+	defer a.Shutdown()
+
+	// Register node with a service and check
+	check := structs.HealthCheck{
+		Node:      "foo",
+		CheckID:   "foo-check",
+		Name:      "foo check",
+		ServiceID: "api",
+		Definition: structs.HealthCheckDefinition{
+			UDP:      "localhost:8888",
+			Interval: 5 * time.Second,
+		},
+	}
+
+	args := &structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "foo",
+		Address:    "127.0.0.1",
+		Service: &structs.NodeService{
+			Service: "api",
+		},
+		Check: &check,
+	}
+
+	var out struct{}
+	if err := a.RPC("Catalog.Register", args, &out); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	retry.Run(t, func(r *retry.R) {
+		req, _ := http.NewRequest("GET", "/v1/health/checks/api", nil)
+		resp := httptest.NewRecorder()
+		obj, err := a.srv.HealthServiceChecks(resp, req)
+		if err != nil {
+			r.Fatalf("err: %v", err)
+		}
+
+		checks := obj.(structs.HealthChecks)
+		if len(checks) != 1 {
+			r.Fatalf("expected 1 check, got: %d", len(checks))
+		}
+		if checks[0].CheckID != check.CheckID {
+			r.Fatalf("expected check id %s, got %s", check.Type, checks[0].Type)
+		}
+		if checks[0].Type != "udp" {
+			r.Fatalf("expected check type udp, got %s", checks[0].Type)
+		}
+	})
+}
+
 func TestCatalogServiceNodes(t *testing.T) {
 	if testing.Short() {
 		t.Skip("too slow for testing.Short")
@@ -1470,6 +1527,111 @@ func TestCatalogNodeServiceList(t *testing.T) {
 	require.NotNil(t, proxySvc, "Missing proxy service registration")
 	// Proxy service should have it's config intact
 	require.Equal(t, args.Service.Proxy, proxySvc.Proxy)
+}
+
+func TestCatalogNodeServiceList_MergeCentralConfig(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
+	t.Parallel()
+
+	a := NewTestAgent(t, "")
+	defer a.Shutdown()
+	testrpc.WaitForLeader(t, a.RPC, "dc1")
+
+	// Register the service
+	registerServiceReq := registerService(t, a)
+	// Register proxy-defaults
+	proxyGlobalEntry := registerProxyDefaults(t, a)
+	// Register service-defaults
+	serviceDefaultsConfigEntry := registerServiceDefaults(t, a, registerServiceReq.Service.Proxy.DestinationServiceName)
+
+	url := fmt.Sprintf("/v1/catalog/node-services/%s?merge-central-config", registerServiceReq.Node)
+	req, _ := http.NewRequest("GET", url, nil)
+	resp := httptest.NewRecorder()
+	obj, err := a.srv.CatalogNodeServiceList(resp, req)
+	require.NoError(t, err)
+	assertIndex(t, resp)
+
+	nodeServices := obj.(*structs.NodeServiceList)
+	// validate response
+	require.Len(t, nodeServices.Services, 1)
+	validateMergeCentralConfigResponse(t, nodeServices.Services[0].ToServiceNode(nodeServices.Node.Node), registerServiceReq, proxyGlobalEntry, serviceDefaultsConfigEntry)
+}
+
+func TestCatalogNodeServiceList_MergeCentralConfigBlocking(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
+	t.Parallel()
+
+	a := NewTestAgent(t, "")
+	defer a.Shutdown()
+	testrpc.WaitForLeader(t, a.RPC, "dc1")
+
+	// Register the service
+	registerServiceReq := registerService(t, a)
+	// Register proxy-defaults
+	proxyGlobalEntry := registerProxyDefaults(t, a)
+
+	// Run the query
+	rpcReq := structs.NodeSpecificRequest{
+		Datacenter:         "dc1",
+		Node:               registerServiceReq.Node,
+		MergeCentralConfig: true,
+	}
+	var rpcResp structs.IndexedNodeServiceList
+	require.NoError(t, a.RPC("Catalog.NodeServiceList", &rpcReq, &rpcResp))
+	require.Len(t, rpcResp.NodeServices.Services, 1)
+	nodeService := rpcResp.NodeServices.Services[0]
+	require.Equal(t, registerServiceReq.Service.Service, nodeService.Service)
+	// validate proxy global defaults are resolved in the merged service config
+	require.Equal(t, proxyGlobalEntry.Config, nodeService.Proxy.Config)
+	require.Equal(t, proxyGlobalEntry.Mode, nodeService.Proxy.Mode)
+
+	// Async cause a change - register service defaults
+	waitIndex := rpcResp.Index
+	start := time.Now()
+	var serviceDefaultsConfigEntry structs.ServiceConfigEntry
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		// Register service-defaults
+		serviceDefaultsConfigEntry = registerServiceDefaults(t, a, registerServiceReq.Service.Proxy.DestinationServiceName)
+	}()
+
+	const waitDuration = 3 * time.Second
+RUN_BLOCKING_QUERY:
+
+	url := fmt.Sprintf("/v1/catalog/node-services/%s?merge-central-config&wait=%s&index=%d",
+		registerServiceReq.Node, waitDuration.String(), waitIndex)
+	req, _ := http.NewRequest("GET", url, nil)
+	resp := httptest.NewRecorder()
+	obj, err := a.srv.CatalogNodeServiceList(resp, req)
+	require.NoError(t, err)
+	assertIndex(t, resp)
+
+	elapsed := time.Since(start)
+	idx := getIndex(t, resp)
+	if idx < waitIndex {
+		t.Fatalf("bad index returned: %v", idx)
+	} else if idx == waitIndex {
+		if elapsed > waitDuration {
+			// This should prevent the loop from running longer than the waitDuration
+			t.Fatalf("too slow: %v", elapsed)
+		}
+		goto RUN_BLOCKING_QUERY
+	}
+	// Should block at least 100ms before getting the changed results
+	if elapsed < 100*time.Millisecond {
+		t.Fatalf("too fast: %v", elapsed)
+	}
+
+	nodeServices := obj.(*structs.NodeServiceList)
+	// validate response
+	require.Len(t, nodeServices.Services, 1)
+	validateMergeCentralConfigResponse(t, nodeServices.Services[0].ToServiceNode(nodeServices.Node.Node), registerServiceReq, proxyGlobalEntry, serviceDefaultsConfigEntry)
 }
 
 func TestCatalogNodeServices_Filter(t *testing.T) {

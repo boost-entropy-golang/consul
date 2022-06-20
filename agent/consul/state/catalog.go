@@ -1164,24 +1164,6 @@ func serviceListTxn(tx ReadTxn, ws memdb.WatchSet, entMeta *acl.EnterpriseMeta, 
 	return idx, results, nil
 }
 
-func serviceExists(tx ReadTxn, ws memdb.WatchSet, name string, entMeta *acl.EnterpriseMeta, peerName string) (uint64, bool, error) {
-	idx := catalogServicesMaxIndex(tx, entMeta, peerName)
-	q := Query{
-		Value:          name,
-		EnterpriseMeta: *entMeta,
-		PeerName:       peerName,
-	}
-	watchCh, existing, err := tx.FirstWatch(tableServices, indexService, q)
-	if err != nil {
-		return idx, false, fmt.Errorf("failed querying for service: %s", err)
-	}
-	ws.Add(watchCh)
-	if existing == nil {
-		return idx, false, nil
-	}
-	return idx, true, nil
-}
-
 // ServicesByNodeMeta returns all services, filtered by the given node metadata.
 func (s *Store) ServicesByNodeMeta(ws memdb.WatchSet, filters map[string]string, entMeta *acl.EnterpriseMeta, peerName string) (uint64, structs.Services, error) {
 	tx := s.db.Txn(false)
@@ -3993,7 +3975,7 @@ func (s *Store) ServiceTopology(
 
 	// Only transparent proxies / connect native services have upstreams from intentions
 	if hasTransparent || connectNative {
-		idx, intentionUpstreams, err := s.intentionTopologyTxn(tx, ws, sn, false, defaultAllow)
+		idx, intentionUpstreams, err := s.intentionTopologyTxn(tx, ws, sn, false, defaultAllow, structs.IntentionTargetService)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -4027,14 +4009,7 @@ func (s *Store) ServiceTopology(
 		Partition: entMeta.PartitionOrDefault(),
 		Name:      service,
 	}
-	_, srcIntentions, err := compatIntentionMatchOneTxn(
-		tx,
-		ws,
-		matchEntry,
-
-		// The given service is a source relative to its upstreams
-		structs.IntentionMatchSource,
-	)
+	_, srcIntentions, err := compatIntentionMatchOneTxn(tx, ws, matchEntry, structs.IntentionMatchSource, structs.IntentionTargetService)
 	if err != nil {
 		return 0, nil, fmt.Errorf("failed to query intentions for %s", sn.String())
 	}
@@ -4117,7 +4092,7 @@ func (s *Store) ServiceTopology(
 		downstreamSources[dn.String()] = structs.TopologySourceRegistration
 	}
 
-	idx, intentionDownstreams, err := s.intentionTopologyTxn(tx, ws, sn, true, defaultAllow)
+	idx, intentionDownstreams, err := s.intentionTopologyTxn(tx, ws, sn, true, defaultAllow, structs.IntentionTargetService)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -4146,14 +4121,7 @@ func (s *Store) ServiceTopology(
 		downstreamSources[svc.Name.String()] = source
 	}
 
-	_, dstIntentions, err := compatIntentionMatchOneTxn(
-		tx,
-		ws,
-		matchEntry,
-
-		// The given service is a destination relative to its downstreams
-		structs.IntentionMatchDestination,
-	)
+	_, dstIntentions, err := compatIntentionMatchOneTxn(tx, ws, matchEntry, structs.IntentionMatchDestination, structs.IntentionTargetService)
 	if err != nil {
 		return 0, nil, fmt.Errorf("failed to query intentions for %s", sn.String())
 	}

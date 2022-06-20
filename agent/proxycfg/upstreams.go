@@ -88,6 +88,34 @@ func (s *handlerUpstreams) handleUpdateUpstreams(ctx context.Context, u UpdateEv
 			return err
 		}
 
+	case strings.HasPrefix(u.CorrelationID, upstreamPeerWatchIDPrefix):
+		resp, ok := u.Result.(*structs.IndexedCheckServiceNodes)
+		if !ok {
+			return fmt.Errorf("invalid type for response: %T", u.Result)
+		}
+		uidString := strings.TrimPrefix(u.CorrelationID, upstreamPeerWatchIDPrefix)
+
+		uid := UpstreamIDFromString(uidString)
+
+		filteredNodes := hostnameEndpoints(
+			s.logger,
+			GatewayKey{ /*empty so it never matches*/ },
+			resp.Nodes,
+		)
+		if len(filteredNodes) > 0 {
+			upstreamsSnapshot.PeerUpstreamEndpoints[uid] = filteredNodes
+			upstreamsSnapshot.PeerUpstreamEndpointsUseHostnames[uid] = struct{}{}
+		} else {
+			upstreamsSnapshot.PeerUpstreamEndpoints[uid] = resp.Nodes
+			delete(upstreamsSnapshot.PeerUpstreamEndpointsUseHostnames, uid)
+		}
+
+		if s.kind != structs.ServiceKindConnectProxy || s.proxyCfg.Mode != structs.ProxyModeTransparent {
+			return nil
+		}
+
+		s.logger.Warn("skipping transparent proxy update for peered upstream")
+
 	case strings.HasPrefix(u.CorrelationID, "upstream-target:"):
 		resp, ok := u.Result.(*structs.IndexedCheckServiceNodes)
 		if !ok {

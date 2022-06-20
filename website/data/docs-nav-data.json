@@ -541,6 +541,10 @@
                   {
                     "title": "Snapshot Agent Config",
                     "path": "k8s/installation/vault/data-integration/snapshot-agent-config"
+                  },
+                  {
+                    "title": "Webhook Certificates",
+                    "path": "k8s/installation/vault/data-integration/webhook-certs"
                   }
                 ]
               },
@@ -740,6 +744,23 @@
       {
         "title": "Configuration Reference",
         "path": "ecs/configuration-reference"
+      }
+    ]
+  },
+  {
+    "title": "AWS Lambda <sup>BETA</sup>",
+    "routes": [
+      {
+        "title": "Overview",
+        "path": "lambda"
+      },
+      {
+        "title": "Register Lambda Functions",
+        "path": "lambda/registration"
+      },
+      {
+        "title": "Invoke Lambda Functions",
+        "path": "lambda/invocation"
       }
     ]
   },

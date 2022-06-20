@@ -776,9 +776,15 @@ func (r *ServiceSpecificRequest) CacheMinIndex() uint64 {
 
 // NodeSpecificRequest is used to request the information about a single node
 type NodeSpecificRequest struct {
-	Datacenter         string
-	Node               string
-	PeerName           string
+	Datacenter string
+	Node       string
+	PeerName   string
+	// MergeCentralConfig when set to true returns a service definition merged with
+	// the proxy-defaults/global and service-defaults/:service config entries.
+	// This can be used to ensure a full service definition is returned in the response
+	// especially when the service might not be written into the catalog that way.
+	MergeCentralConfig bool
+
 	acl.EnterpriseMeta `hcl:",squash" mapstructure:",squash"`
 	QueryOptions
 }
@@ -801,6 +807,7 @@ func (r *NodeSpecificRequest) CacheInfo() cache.RequestInfo {
 		r.Node,
 		r.Filter,
 		r.EnterpriseMeta,
+		r.MergeCentralConfig,
 	}, nil)
 	if err == nil {
 		// If there is an error, we don't set the key. A blank key forces
@@ -1178,6 +1185,11 @@ const (
 	// This service allows external traffic to enter the mesh based on
 	// centralized configuration.
 	ServiceKindIngressGateway ServiceKind = "ingress-gateway"
+
+	// ServiceKindDestination is a Destination  for the Connect feature.
+	// This service allows external traffic to exit the mesh through a terminating gateway
+	// based on centralized configuration.
+	ServiceKindDestination ServiceKind = "destination"
 )
 
 // Type to hold a address and port of a service
@@ -1251,6 +1263,13 @@ type PeeringServiceMeta struct {
 	SNI      []string `json:",omitempty"`
 	SpiffeID []string `json:",omitempty"`
 	Protocol string   `json:",omitempty"`
+}
+
+func (m *PeeringServiceMeta) PrimarySNI() string {
+	if m == nil || len(m.SNI) == 0 {
+		return ""
+	}
+	return m.SNI[0]
 }
 
 func (ns *NodeService) BestAddress(wan bool) (string, int) {
@@ -1663,7 +1682,7 @@ type HealthCheck struct {
 	ServiceID   string        // optional associated service
 	ServiceName string        // optional service name
 	ServiceTags []string      // optional service tags
-	Type        string        // Check type: http/ttl/tcp/etc
+	Type        string        // Check type: http/ttl/tcp/udp/etc
 
 	Interval string // from definition
 	Timeout  string // from definition
@@ -1728,6 +1747,7 @@ type HealthCheckDefinition struct {
 	Body                           string              `json:",omitempty"`
 	DisableRedirects               bool                `json:",omitempty"`
 	TCP                            string              `json:",omitempty"`
+	UDP                            string              `json:",omitempty"`
 	H2PING                         string              `json:",omitempty"`
 	H2PingUseTLS                   bool                `json:",omitempty"`
 	Interval                       time.Duration       `json:",omitempty"`
@@ -1878,6 +1898,7 @@ func (c *HealthCheck) CheckType() *CheckType {
 		Body:                           c.Definition.Body,
 		DisableRedirects:               c.Definition.DisableRedirects,
 		TCP:                            c.Definition.TCP,
+		UDP:                            c.Definition.UDP,
 		H2PING:                         c.Definition.H2PING,
 		H2PingUseTLS:                   c.Definition.H2PingUseTLS,
 		Interval:                       c.Definition.Interval,
@@ -2138,6 +2159,12 @@ type IndexedServices struct {
 	// this is needed to be able to properly filter the list based on ACLs
 	acl.EnterpriseMeta
 	QueryMeta
+}
+
+// PeeredServiceName is a basic tuple of ServiceName and peer
+type PeeredServiceName struct {
+	ServiceName ServiceName
+	Peer        string
 }
 
 type ServiceName struct {

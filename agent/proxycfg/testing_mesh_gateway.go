@@ -5,12 +5,16 @@ import (
 	"time"
 
 	"github.com/mitchellh/go-testing-interface"
+	"github.com/stretchr/testify/assert"
 
+	"github.com/hashicorp/consul/agent/connect"
+	"github.com/hashicorp/consul/agent/consul/discoverychain"
 	"github.com/hashicorp/consul/agent/structs"
+	"github.com/hashicorp/consul/proto/pbpeering"
 )
 
 func TestConfigSnapshotMeshGateway(t testing.T, variant string, nsFn func(ns *structs.NodeService), extraUpdates []UpdateEvent) *ConfigSnapshot {
-	roots, _ := TestCerts(t)
+	roots, leaf := TestCertsForMeshGateway(t)
 
 	var (
 		populateServices    = true
@@ -20,6 +24,58 @@ func TestConfigSnapshotMeshGateway(t testing.T, variant string, nsFn func(ns *st
 
 	switch variant {
 	case "default":
+	case "peered-services":
+		var (
+			fooSN = structs.NewServiceName("foo", nil)
+			barSN = structs.NewServiceName("bar", nil)
+			girSN = structs.NewServiceName("gir", nil)
+
+			fooChain = discoverychain.TestCompileConfigEntries(t, "foo", "default", "default", "dc1", connect.TestClusterID+".consul", nil)
+			barChain = discoverychain.TestCompileConfigEntries(t, "bar", "default", "default", "dc1", connect.TestClusterID+".consul", nil)
+			girChain = discoverychain.TestCompileConfigEntries(t, "gir", "default", "default", "dc1", connect.TestClusterID+".consul", nil)
+		)
+
+		assert.True(t, fooChain.Default)
+		assert.True(t, barChain.Default)
+		assert.True(t, girChain.Default)
+
+		extraUpdates = append(extraUpdates,
+			UpdateEvent{
+				CorrelationID: exportedServiceListWatchID,
+				Result: &structs.IndexedExportedServiceList{
+					Services: map[string]structs.ServiceList{
+						"peer-a": []structs.ServiceName{fooSN, barSN},
+						"peer-b": []structs.ServiceName{girSN},
+					},
+				},
+			},
+			UpdateEvent{
+				CorrelationID: "discovery-chain:" + fooSN.String(),
+				Result: &structs.DiscoveryChainResponse{
+					Chain: fooChain,
+				},
+			},
+			UpdateEvent{
+				CorrelationID: "discovery-chain:" + barSN.String(),
+				Result: &structs.DiscoveryChainResponse{
+					Chain: barChain,
+				},
+			},
+			UpdateEvent{
+				CorrelationID: "discovery-chain:" + girSN.String(),
+				Result: &structs.DiscoveryChainResponse{
+					Chain: girChain,
+				},
+			},
+			UpdateEvent{
+				CorrelationID: peeringTrustBundlesWatchID,
+				Result:        TestPeerTrustBundles(t),
+			},
+			UpdateEvent{
+				CorrelationID: leafWatchID,
+				Result:        leaf,
+			},
+		)
 	case "federation-states":
 		populateServices = true
 		useFederationStates = true
@@ -258,6 +314,12 @@ func TestConfigSnapshotMeshGateway(t testing.T, variant string, nsFn func(ns *st
 			Result:        roots,
 		},
 		{
+			CorrelationID: exportedServiceListWatchID,
+			Result: &structs.IndexedExportedServiceList{
+				Services: nil,
+			},
+		},
+		{
 			CorrelationID: serviceListWatchID,
 			Result: &structs.IndexedServiceList{
 				Services: nil,
@@ -273,6 +335,18 @@ func TestConfigSnapshotMeshGateway(t testing.T, variant string, nsFn func(ns *st
 		{
 			CorrelationID: datacentersWatchID,
 			Result:        &[]string{"dc1"},
+		},
+		{
+			CorrelationID: peeringTrustBundlesWatchID,
+			Result: &pbpeering.TrustBundleListByServiceResponse{
+				Bundles: nil,
+			},
+		},
+		{
+			CorrelationID: meshConfigEntryID,
+			Result: &structs.ConfigEntryResponse{
+				Entry: nil,
+			},
 		},
 	}
 
